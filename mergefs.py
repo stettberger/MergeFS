@@ -97,7 +97,7 @@ for file distribution"""
     def has_file(self, fn):
         return fn in self.files
 
-    def send(self, fn, datastore):
+    def send(self, fn, datastore, remove=True):
         assert datastore != self
         old_fn = os.path.join(self.path, fn)
         new_fn = os.path.join(datastore.path, fn)
@@ -107,7 +107,8 @@ for file distribution"""
 
         if real_operation:
             shutil.copy2(old_fn, new_fn)
-            os.unlink(old_fn)
+            if remove:
+                os.unlink(old_fn)
 
             # Filesize in Kilobyte approximated
             size = os.stat(new_fn).st_size / 1024 + 1
@@ -115,9 +116,11 @@ for file distribution"""
             size = os.stat(old_fn).st_size / 1024 + 1
 
         # Update filesystem Info
-        self.filesystem.consume(-1 * size)
+        if remove:
+            self.filesystem.consume(-1 * size)
+            self.files.remove(fn)
+
         datastore.filesystem.consume(size)
-        self.files.remove(fn)
         datastore.files.add(fn)
 
         return (old_fn, new_fn)
@@ -190,6 +193,36 @@ def fixup(mergedir, stores):
                     mkdir(os.path.dirname(to_fn))
                     os.symlink(from_fn, to_fn)
 
+def get_num_copy_dict(stores):
+    d = {}
+    for store in stores:
+        for fn in store.files:
+            (count, stores) = d.get(fn, (0, []))
+            d[fn] = (count + 1, stores + [store])
+    return d
+
+def get_copies(stores):
+    for fn, (count, stores) in get_num_copy_dict(stores).items():
+        print count, fn, ",".join([store.path for store in stores])
+
+def balance(stores, min_num_copies):
+    for fn, (count, used_stores) in get_num_copy_dict(stores).items():
+        if count < min_num_copies:
+            # Filesize in Kilobyte approximated
+            size = os.stat(os.path.join(used_stores[0].path, fn)).st_size / 1024 + 1
+            st = filter(lambda store: store.filesystem.enough_space(size), stores)
+            st = filter(lambda store: not store in used_stores, st)
+            st = sorted(st, key = lambda store: store.store_score())
+            if len(st) == 0:
+                continue
+
+            # Select Datastore with less used space
+            store = st[-1]
+            logging.info("copy %s -> %s" %(os.path.join(used_stores[0].path, fn),
+                                           os.path.join(store.path, fn)))
+            if real_operation:
+                used_stores[0].send(fn, store, remove=False)
+
 if __name__ == '__main__':
     from optparse import OptionParser
     parser = OptionParser()
@@ -207,6 +240,16 @@ if __name__ == '__main__':
     parser.add_option("", "--fixup", dest="fixup", action="store",
                       help="Add all symlinks for files, that aren't in the merge directory")
 
+    parser.add_option("", "--get-num-copies", dest="get_copies", action="store",
+                      help="Get number of copies for every file in the store")
+
+    parser.add_option("", "--min-num-copies", dest="min_num_copies", action="store",
+                      help="Get number of copies for every file in the store",
+                      default = 1)
+
+    parser.add_option("-b", "--balance", dest="balance", action="store",
+                      help="Get number of copies for every file in the store")
+
     parser.add_option('-v', '--verbose', dest='verbose', action='count',
                       help="Increase verbosity (specify multiple times for more)")
 
@@ -222,14 +265,16 @@ if __name__ == '__main__':
 
     real_operation = not options.simulate
 
-    if not options.mergedir:
-        die("No mergedir was given")
+
     if len(args) > 0:
         die("Don't use extra args")
 
     dsm = DatastoreManager()
 
-    mergedir = dsm.add(options.mergedir, mergedir = True)
+    if options.distribute or options.fixup or options.unused:
+        if not options.mergedir:
+            die("No mergedir was given")
+        mergedir = dsm.add(options.mergedir, mergedir = True)
 
     if options.distribute:
         stores = options.distribute.split(",")
@@ -240,6 +285,16 @@ if __name__ == '__main__':
         stores = options.fixup.split(",")
         stores = [dsm.add(store) for store in stores]
         fixup(mergedir, stores)
+
+    if options.balance:
+        stores = options.balance.split(",")
+        stores = [dsm.add(store) for store in stores]
+        balance(stores, int(options.min_num_copies))
+
+    if options.get_copies:
+        stores = options.get_copies.split(",")
+        stores = [dsm.add(store) for store in stores]
+        get_copies(stores)
 
     if options.unused:
         stores = options.unused.split(",")
