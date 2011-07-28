@@ -72,13 +72,13 @@ class Datastore(object):
         if not os.path.isdir(path):
             die("Datastore '%s' doesn't exist or is no directory"%path)
 
-        self.path = os.path.abspath(path)
+        self.path = os.path.normpath(os.path.abspath(path))
         self.files = set([])
         self.symlinks = {}
         for root, dirs, files in os.walk(path):
             for fn in files:
                 fn = os.path.join(root, fn)
-                rel_fn = fn[len(path)+1:]
+                rel_fn = fn[len(self.path)+1:]
                 if os.path.islink(fn):
                     self.symlinks[rel_fn] = os.readlink(fn)
                 elif os.path.isfile(fn):
