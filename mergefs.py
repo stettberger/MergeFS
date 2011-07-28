@@ -8,6 +8,8 @@ import random
 import shutil
 
 
+real_operation = True
+
 def die(msg):
     logging.error(msg)
     sys.exit(-1)
@@ -42,106 +44,165 @@ def mkdir(dirname):
     if  code != 0:
         die("Error while creating directory: %s\n%s" % (dirname, "\n".join(lines)))
 
-def distribute(options):
-    filesystems = {}
-    stores = []
-    def update_filesysteminfo():
-        for store in options['stores']:
-            # Absolute directory name
-            store = os.path.join(os.getcwd(), store)
-            (filesystem, info) = filesystem_info(store)
-            stores.append((store, filesystem))
-            filesystems[filesystem] = info
+class Filesystem(object):
+    _objects = {}
+    @classmethod
+    def get(self, path):
+        (root, info) = filesystem_info(path)
 
-    update_filesysteminfo()
+        if not root in self._objects:
+            self._objects[root] = Filesystem(root)
+        return self._objects[root]
 
+    def __init__(self, path):
+        self.path = path
+        (_, self.info) = filesystem_info(self.path)
+
+    def enough_space(self, size):
+        return self.info['free'] > size
+
+    def free(self):
+        return self.info['free']
+    def consume(self, size):
+        self.info['free'] += size
+
+
+class Datastore(object):
+    def __init__(self, path):
+        if not os.path.isdir(path):
+            die("Datastore '%s' doesn't exist or is no directory"%path)
+
+        self.path = path
+        self.files = set([])
+        self.symlinks = {}
+        for root, dirs, files in os.walk(path):
+            for fn in files:
+                fn = os.path.join(root, fn)
+                rel_fn = fn[len(path)+1:]
+                if os.path.islink(fn):
+                    self.symlinks[rel_fn] = os.readlink(fn)
+                elif os.path.isfile(fn):
+                    self.files.add(rel_fn)
+        # Update Filesystem info
+        self.filesystem = Filesystem.get(path)
+
+    def store_score(self):
+        """Calculate score for the filestore. This is used by choosing algorithm
+for file distribution"""
+        return self.filesystem.free()
+
+    def has_symlink(self, fn):
+        return fn in self.symlinks
+
+    def has_file(self, fn):
+        return fn in self.files
+
+    def send(self, fn, datastore):
+        assert datastore != self
+        old_fn = os.path.join(self.path, fn)
+        new_fn = os.path.join(datastore.path, fn)
+        mkdir(os.path.dirname(new_fn))
+
+        logging.info("%s -> %s" %(old_fn, new_fn))
+
+        if real_operation:
+            shutil.copy2(old_fn, new_fn)
+            os.unlink(old_fn)
+
+            # Filesize in Kilobyte approximated
+            size = os.stat(new_fn).st_size / 1024 + 1
+        else:
+            size = os.stat(old_fn).st_size / 1024 + 1
+
+        # Update filesystem Info
+        self.filesystem.consume(-1 * size)
+        datastore.filesystem.consume(size)
+
+        return (old_fn, new_fn)
+
+
+class DatastoreManager(object):
+    def __init__(self):
+        self._stores = {}
+        self._mergedir = None
+
+    def mergedir(self):
+        """Return the mergedir datastore"""
+        return self._stores[self.mergedir]
+    def add(self, path, mergedir = False):
+        if mergedir:
+            self._mergedir = path
+        else:
+            # Mergedir can't be added twice
+            if path == self._mergedir:
+                die("Can't reuse mergedir as datastore")
+
+        if path in self._stores:
+            return self._stores[path]
+        ds = Datastore(path)
+        self._stores[path] = ds
+        return ds
+
+def distribute(mergedir, stores):
     def select_datastore(filename):
         """Select the datastore for a given filename"""
         # Filesize in Kilobyte approximated
-        size = os.stat(filename).st_size / 1024 + 1
-        st = filter(lambda store: filesystems[store[1]]['free'] > size, stores)
-        st = sorted(st, key = lambda store: filesystems[store[1]]['free'])
+        size = os.stat(os.path.join(mergedir.path, filename)).st_size / 1024 + 1
+        st = filter(lambda store: store.filesystem.enough_space(size), stores)
+        st = sorted(st, key = lambda store: store.store_score())
         if len(st) == 0:
             return None
 
         # Select Datastore with less used space
         store = st[-1]
-        filesystems[store[1]]['free'] -= size
-
         return store # Some appropriate filesystemstore
 
-    # Change to Directory where the to be distributed files are located
-    os.chdir(options['mergedir'])
+    # Iterate over all normal files in mergedir
+    for fn in mergedir.files:
+        selected_store = select_datastore(fn)
+        if not selected_store:
+            logging.warn("No appropriate store for %s was found" % fn)
 
-    for root, dirs, files in os.walk('.'):
-        for fn in files:
-            fn = os.path.join(root, fn)
-            if not os.path.isfile(fn) or os.path.islink(fn):
-                logging.debug("Skipping file: %s" % fn)
-                continue
-            store = select_datastore(fn)
-            if not store:
-                logging.warn("Couldn't get appropriate store for file: %s" % fn)
-                continue
-            path = os.path.normpath(os.path.join(store[0], fn))
-            # Create the directory in the choosen datastore
-            mkdir(os.path.dirname(path))
+        (old, new) = mergedir.send(fn, selected_store)
+        if real_operation:
+            os.symlink(new, old)
 
-            logging.info("%s -> %s" %(fn, path))
 
-            shutil.copy2(fn, os.path.dirname(path))
-            os.unlink(fn)
-            os.symlink(path, fn)
-
-def unused(options):
-    symlinks = {}
-    stores = map(lambda store: os.path.normpath(os.path.join(os.getcwd(), store)), options['stores'])
-
-    # Change to Directory where the to be distributed files are located
-    os.chdir(options['mergedir'])
-    for root, dirs, files in os.walk('.'):
-        for fn in files:
-            fn = os.path.join(root, fn)
-            if not os.path.islink(fn):
-                continue
-            symlinks[os.path.abspath(os.readlink(fn))] = fn
+def unused(mergedir, stores):
     for store in stores:
-        for root, dirs, files in os.walk(store):
-            for fn in files:
-                fn = os.path.join(root, fn)
-                if not fn in symlinks:
-                    print fn
+        for fn in store.files:
+            if not fn in mergedir.symlinks:
+                print os.path.join(mergedir.path, fn)
 
-def fixup(options):
-    symlinks = {}
-    mergedir = os.path.abspath(options['mergedir'])
-    stores = map(lambda store: os.path.normpath(os.path.join(os.getcwd(), store)), options['stores'])
-
+def fixup(mergedir, stores):
     for store in stores:
-        os.chdir(store)
-        for root, dirs, files in os.walk("."):
-            for fn in files:
-                fn = os.path.join(root, fn)
-                absfn = os.path.abspath(fn)
-                if not os.path.isfile(fn) or os.path.islink(fn):
-                    continue
-                if os.path.exists(os.path.join(mergedir, fn)):
-                    continue
-                mergefn = os.path.normpath(os.path.join(mergedir, fn))
+        for fn in store.files:
+            if not fn in mergedir.symlinks:
+                from_fn = os.path.join(store.path, fn)
+                to_fn = os.path.join(mergedir.path, fn)
+                logging.info("symlink %s -> %s" %(from_fn, to_fn))
 
-                logging.info("symlink %s -> %s" %(absfn, mergefn))
-                mkdir(os.path.dirname(mergefn))
-                os.symlink(absfn, mergefn)
+                if real_operation:
+                    mkdir(os.path.dirname(to_fn))
+                    os.symlink(from_fn, to_fn)
 
 if __name__ == '__main__':
     from optparse import OptionParser
     parser = OptionParser()
-    parser.add_option("", "--distribute", dest="distribute", action="store_true",
+
+    parser.add_option("-s", "--simulate", dest="simulate", action="store_true",
+                      help="Simulate all operations", default = False)
+
+    parser.add_option("-m", "--mergedir", dest="mergedir", action="store",
+                      help="Directory where the symlinks will be located")
+
+    parser.add_option("", "--distribute", dest="distribute", action="store",
                       help="Distribute all normal files from mergedir into the data stores")
-    parser.add_option("", "--unused", dest="unused", action="store_true",
+    parser.add_option("", "--unused", dest="unused", action="store",
                       help="Find all unused objects in the stores, that have no symlink")
-    parser.add_option("", "--fixup", dest="fixup", action="store_true",
+    parser.add_option("", "--fixup", dest="fixup", action="store",
                       help="Add all symlinks for files, that aren't in the merge directory")
+
     parser.add_option('-v', '--verbose', dest='verbose', action='count',
                       help="Increase verbosity (specify multiple times for more)")
 
@@ -155,26 +216,29 @@ if __name__ == '__main__':
 
     logging.basicConfig(level=log_level)
 
-    if len(args) < 2:
-        die("Usage: %s <mergedir> <store1> [<store2> ...]")
+    real_operation = not options.simulate
 
-    mergedir = args[0]
-    stores = args[1:]
-    options =  eval(str(options))
-    options.update({'mergedir': args[0], 'stores': args[1:]})
+    if not options.mergedir:
+        die("No mergedir was given")
+    if len(args) > 0:
+        die("Don't use extra args")
 
-    if not os.path.isdir(options['mergedir']):
-        die("Mergedir doesn't exist or is no directory")
-    for d in options['stores']:
-        if not os.path.isdir(d):
-            die("Store: %s doesn't exist or is no directory" % d)
+    dsm = DatastoreManager()
 
-    if options['distribute']:
-        distribute(options)
-    elif options['unused']:
-        unused(options)
-    elif options['fixup']:
-        fixup(options)
-    else:
-        die("No actions was given (-h for details)")
+    mergedir = dsm.add(options.mergedir, mergedir = True)
+
+    if options.distribute:
+        stores = options.distribute.split(",")
+        stores = [dsm.add(store) for store in stores]
+        distribute(mergedir, stores)
+
+    if options.fixup:
+        stores = options.fixup.split(",")
+        stores = [dsm.add(store) for store in stores]
+        fixup(mergedir, stores)
+
+    if options.unused:
+        stores = options.unused.split(",")
+        stores = [dsm.add(store) for store in stores]
+        unused(mergedir, stores)
 
