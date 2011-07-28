@@ -72,7 +72,7 @@ class Datastore(object):
         if not os.path.isdir(path):
             die("Datastore '%s' doesn't exist or is no directory"%path)
 
-        self.path = path
+        self.path = os.path.abspath(path)
         self.files = set([])
         self.symlinks = {}
         for root, dirs, files in os.walk(path):
@@ -117,6 +117,8 @@ for file distribution"""
         # Update filesystem Info
         self.filesystem.consume(-1 * size)
         datastore.filesystem.consume(size)
+        self.files.remove(fn)
+        datastore.files.add(fn)
 
         return (old_fn, new_fn)
 
@@ -164,6 +166,7 @@ def distribute(mergedir, stores):
             logging.warn("No appropriate store for %s was found" % fn)
 
         (old, new) = mergedir.send(fn, selected_store)
+        mergedir.symlinks[fn] = new
         if real_operation:
             os.symlink(new, old)
 
@@ -181,6 +184,7 @@ def fixup(mergedir, stores):
                 from_fn = os.path.join(store.path, fn)
                 to_fn = os.path.join(mergedir.path, fn)
                 logging.info("symlink %s -> %s" %(from_fn, to_fn))
+                mergedir.symlinks[fn] = to_fn
 
                 if real_operation:
                     mkdir(os.path.dirname(to_fn))
